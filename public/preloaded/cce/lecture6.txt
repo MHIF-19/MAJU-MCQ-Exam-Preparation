@@ -1,0 +1,19 @@
+Topic 6: Digital Citizenship and Technology
+
+1. Use of digital platforms for civic engagement:
+- Social media (X, Facebook, YouTube) and messaging apps (WhatsApp) are widely used for citizen journalism, community organizing, raising donations, and amplifying minority voices.
+- Digital petitions and online campaigns allow citizens to hold public representatives accountable, voice grievances, and call for policy reforms.
+
+2. Cyber ethics and responsible social media use:
+- Digital footprint: Every action online leaves a trace, requiring mindfulness of privacy and security.
+- Responsible behaviors: Avoiding the spread of fake news, cross-checking information before sharing, refraining from cyberbullying, hate speech, and online harassment.
+- Legal framework: In Pakistan, the Prevention of Electronic Crimes Act (PECA, 2016) regulates cybercrimes, hacking, online harassment, and defamation.
+
+3. Digital divide and access to information:
+- The digital divide is the gap between demographics and regions that have access to modern information and communications technology (ICT) and those that do not.
+- Causes: Infrastructure issues in rural/remote areas (like parts of Balochistan, KP, and Gilgit-Baltistan), high costs of devices/internet, and low digital literacy.
+- Access to information is a fundamental right (Article 19-A of the Constitution of Pakistan) that is severely limited for those on the wrong side of the digital divide.
+
+4. Technology’s impact on democracy and activism:
+- Positive: Democratization of information, direct citizen-to-government interaction, and rapid mobilization for social causes.
+- Negative: Spread of deepfakes, algorithmic echo chambers that polarize public opinion, surveillance concerns, and internet shutdowns that restrict freedom of speech and expression.
