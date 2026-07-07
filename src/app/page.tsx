@@ -179,7 +179,7 @@ export default function Home() {
 
               <div className="hidden md:flex items-center gap-1 text-xs text-white/30">
                 <span className="px-2 py-1 rounded bg-white/[0.04]">
-                  Vibe Coded by Muhammad Hammad FA24-BSCS-0202 using Antigravity
+                  Vibe Coded by Muhammad Hammad (FA24-BSCS-0202) using Antigravity
                 </span>
               </div>
             </div>
