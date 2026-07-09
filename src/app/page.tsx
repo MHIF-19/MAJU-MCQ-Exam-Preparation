@@ -255,7 +255,6 @@ export default function Home() {
                         className="relative rounded-2xl border border-white/[0.08] bg-white/[0.02] hover:bg-white/[0.04] p-6 flex flex-col justify-between overflow-hidden group cursor-pointer"
                         onClick={() => setActiveSubStep("upload")}
                       >
-                        {/* Glow background */}
                         <div className="absolute inset-0 bg-gradient-to-br from-violet-600/10 to-fuchsia-600/10 opacity-0 group-hover:opacity-100 transition-opacity blur-xl" />
                         
                         <div className="space-y-4 relative z-10">

@@ -48,4 +48,3 @@ Open [http://localhost:3000](http://localhost:3000) with your browser to start p
 - `src/app/api/preloaded/`: API route responsible for dynamically parsing preloaded materials.
 - `src/app/api/parse/`: API route for individual document parsing.
 - `src/app/api/generate/`: API route for prompt engineering and Gemini generation.
-- `src/lib/subjects.ts`: Central config for preloaded subjects scalability.
