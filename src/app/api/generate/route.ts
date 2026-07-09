@@ -4,20 +4,70 @@ import type { QuizQuestion } from "@/types";
 
 export const maxDuration = 60;
 
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+function parseGeminiApiKeys(): string[] {
+  const rawKeys = [
+    process.env.GEMINI_API_KEYS,
+    process.env.GEMINI_API_KEY_LIST,
+    process.env.GEMINI_API_KEY,
+  ]
+    .filter(Boolean)
+    .join("\n")
+    .trim();
 
-export async function POST(request: NextRequest) {
-  if (!GEMINI_API_KEY) {
-    return NextResponse.json(
-      {
-        success: false,
-        error:
-          "Gemini API key is not configured. Set GEMINI_API_KEY in your environment variables.",
-      },
-      { status: 500 }
+  if (!rawKeys) {
+    return [];
+  }
+
+  return Array.from(
+    new Set(
+      rawKeys
+        .split(/[\n,]+/)
+        .map((key) => key.trim())
+        .filter(Boolean)
+    )
+  );
+}
+
+function shuffleArray<T>(items: T[]): T[] {
+  const cloned = [...items];
+  for (let i = cloned.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [cloned[i], cloned[j]] = [cloned[j], cloned[i]];
+  }
+  return cloned;
+}
+
+async function generateWithRotatingApiKey(
+  prompt: string,
+  config: { temperature: number; maxOutputTokens: number }
+) {
+  const apiKeys = shuffleArray(parseGeminiApiKeys());
+
+  if (apiKeys.length === 0) {
+    throw new Error(
+      "Gemini API key is not configured. Set GEMINI_API_KEYS or GEMINI_API_KEY in your environment variables."
     );
   }
 
+  let lastError: unknown;
+
+  for (const apiKey of apiKeys) {
+    try {
+      const ai = new GoogleGenAI({ apiKey });
+      return await ai.models.generateContent({
+        model: "gemini-2.5-flash",
+        contents: prompt,
+        config,
+      });
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  throw lastError ?? new Error("Failed to generate quiz with the provided Gemini API keys.");
+}
+
+export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
     const { text, numQuestions, difficulty } = body;
@@ -28,8 +78,6 @@ export async function POST(request: NextRequest) {
         { status: 400 }
       );
     }
-
-    const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
 
     const prompt = `You are an expert university professor. Study all provided material carefully.
 Generate exactly ${numQuestions} multiple-choice questions with ${difficulty} difficulty.
@@ -65,18 +113,13 @@ Each element must follow this exact schema:
 STUDY MATERIAL:
 ${text.substring(0, 80000)}`;
 
-    const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash",
-      contents: prompt,
-      config: {
-        temperature: 0.7,
-        maxOutputTokens: 16384,
-      },
+    const response = await generateWithRotatingApiKey(prompt, {
+      temperature: 0.7,
+      maxOutputTokens: 16384,
     });
 
     const responseText = response.text?.trim() || "";
 
-    // Clean the response - remove markdown code blocks if present
     let jsonText = responseText;
     if (jsonText.startsWith("```")) {
       jsonText = jsonText
@@ -88,7 +131,6 @@ ${text.substring(0, 80000)}`;
     try {
       questions = JSON.parse(jsonText);
     } catch {
-      // Try to extract JSON array from the response
       const arrayMatch = jsonText.match(/\[[\s\S]*\]/);
       if (arrayMatch) {
         questions = JSON.parse(arrayMatch[0]);
@@ -104,7 +146,6 @@ ${text.substring(0, 80000)}`;
       }
     }
 
-    // Validate the questions
     if (!Array.isArray(questions) || questions.length === 0) {
       return NextResponse.json(
         {
@@ -115,7 +156,6 @@ ${text.substring(0, 80000)}`;
       );
     }
 
-    // Validate each question structure
     const validQuestions = questions.filter(
       (q) =>
         q.question &&
