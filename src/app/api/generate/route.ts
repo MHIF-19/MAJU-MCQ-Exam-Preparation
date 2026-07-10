@@ -28,13 +28,8 @@ function parseGeminiApiKeys(): string[] {
   );
 }
 
-function shuffleArray<T>(items: T[]): T[] {
-  const cloned = [...items];
-  for (let i = cloned.length - 1; i > 0; i -= 1) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [cloned[i], cloned[j]] = [cloned[j], cloned[i]];
-  }
-  return cloned;
+function getRandomKey<T>(items: T[]): T {
+  return items[Math.floor(Math.random() * items.length)];
 }
 
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-1.5-pro";
@@ -43,7 +38,7 @@ async function generateWithRotatingApiKey(
   prompt: string,
   config: { temperature: number; maxOutputTokens: number }
 ) {
-  const apiKeys = shuffleArray(parseGeminiApiKeys());
+  const apiKeys = parseGeminiApiKeys();
 
   if (apiKeys.length === 0) {
     throw new Error(
@@ -51,9 +46,14 @@ async function generateWithRotatingApiKey(
     );
   }
 
-  let lastError: unknown;
+  const selectedKey = getRandomKey(apiKeys);
+  console.info(`Gemini API rotation selected key prefix: ${selectedKey.slice(0, 6)}`);
 
-  for (const apiKey of apiKeys) {
+  let lastError: unknown;
+  const remaining = apiKeys.filter((key) => key !== selectedKey);
+  const tryOrder = [selectedKey, ...remaining];
+
+  for (const apiKey of tryOrder) {
     try {
       const ai = new GoogleGenAI({ apiKey });
       return await ai.models.generateContent({
@@ -63,6 +63,10 @@ async function generateWithRotatingApiKey(
       });
     } catch (error) {
       lastError = error;
+      console.warn(
+        `Gemini key failed: prefix ${apiKey.slice(0, 6)}. Trying next key.`,
+        error
+      );
     }
   }
 
