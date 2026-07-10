@@ -37,6 +37,8 @@ function shuffleArray<T>(items: T[]): T[] {
   return cloned;
 }
 
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-1.5-pro";
+
 async function generateWithRotatingApiKey(
   prompt: string,
   config: { temperature: number; maxOutputTokens: number }
@@ -55,7 +57,7 @@ async function generateWithRotatingApiKey(
     try {
       const ai = new GoogleGenAI({ apiKey });
       return await ai.models.generateContent({
-        model: "gemini-2.5-flash",
+        model: GEMINI_MODEL,
         contents: prompt,
         config,
       });
