@@ -161,12 +161,30 @@ Each element must follow this exact schema:
 STUDY MATERIAL:
 ${text.substring(0, 80000)}`;
 
-    const response = await generateWithRotatingApiKey(prompt, {
+    const rawResponse = await generateWithRotatingApiKey(prompt, {
       temperature: 0.7,
       maxOutputTokens: 16384,
     });
 
-    const responseText = response.text?.trim() || "";
+    // Normalize response from different providers
+    let responseText = "";
+    try {
+      if (!rawResponse) responseText = "";
+      else if (typeof rawResponse === "string") responseText = rawResponse;
+      else if (typeof rawResponse.text === "string") responseText = rawResponse.text;
+      else if (typeof (rawResponse as any).result === "string") responseText = (rawResponse as any).result;
+      else if ((rawResponse as any).choices?.[0]?.message?.content)
+        responseText = (rawResponse as any).choices[0].message.content;
+      else if ((rawResponse as any).choices?.[0]?.text)
+        responseText = (rawResponse as any).choices[0].text;
+      else if ((rawResponse as any).output?.[0]?.content)
+        responseText = (rawResponse as any).output[0].content;
+      else responseText = JSON.stringify(rawResponse);
+    } catch (e) {
+      responseText = String(rawResponse);
+    }
+
+    responseText = (responseText || "").trim();
 
     // Clean the response - remove markdown code blocks if present
     let jsonText = responseText;
