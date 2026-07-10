@@ -45,7 +45,7 @@ function getRandomIndex(max: number) {
 }
 
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-1.5-pro";
-const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || "gpt-4o-mini";
+const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || "google/gemma-4-26b-a4b-it:free";
 const OPENROUTER_ENDPOINT = process.env.OPENROUTER_ENDPOINT || "https://api.openrouter.ai/v1/chat/completions";
 
 async function callOpenRouter(apiKey: string, prompt: string, config: { temperature: number; maxOutputTokens: number }) {
