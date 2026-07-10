@@ -208,7 +208,7 @@ ${text.substring(0, 80000)}`;
     return NextResponse.json(
       {
         success: false,
-        error: "Failed to generate quiz. Please check your internet connection and try again.",
+        error: errorMessage || "Failed to generate quiz. Please try again.",
       },
       { status: 500 }
     );
