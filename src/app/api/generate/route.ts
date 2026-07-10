@@ -1,5 +1,4 @@
 import { NextRequest, NextResponse } from "next/server";
-import { GoogleGenAI } from "@google/genai";
 import type { QuizQuestion } from "@/types";
 
 export const maxDuration = 60;
@@ -18,6 +17,7 @@ function parseKeysFromEnv(varNames: string[]): string[] {
     new Set(
       raw
         .split(/[\n,;]+/)
+        .map((s) => s.trim().replace(/^['"]|['"]$/g, ""))
         .map((s) => s.trim())
         .filter(Boolean)
     )
@@ -25,18 +25,10 @@ function parseKeysFromEnv(varNames: string[]): string[] {
 }
 
 function parseProviderKeys(): { provider: string; apiKey: string }[] {
+  // Only OpenRouter keys are accepted in this configuration
   const providers: { provider: string; apiKey: string }[] = [];
-
-  const gemini = parseKeysFromEnv([
-    "GEMINI_API_KEYS",
-    "GEMINI_API_KEY_LIST",
-    "GEMINI_API_KEY",
-  ]);
-  for (const k of gemini) providers.push({ provider: "gemini", apiKey: k });
-
   const openrouter = parseKeysFromEnv(["OPENROUTER_API_KEYS", "OPENROUTER_API_KEY"]);
   for (const k of openrouter) providers.push({ provider: "openrouter", apiKey: k });
-
   return providers;
 }
 
@@ -44,9 +36,8 @@ function getRandomIndex(max: number) {
   return Math.floor(Math.random() * max);
 }
 
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-1.5-pro";
 const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || "google/gemma-4-26b-a4b-it:free";
-const OPENROUTER_ENDPOINT = process.env.OPENROUTER_ENDPOINT || "https://api.openrouter.ai/v1/chat/completions";
+const OPENROUTER_ENDPOINT = process.env.OPENROUTER_ENDPOINT || "https://openrouter.ai/api/v1/chat/completions";
 
 async function callOpenRouter(apiKey: string, prompt: string, config: { temperature: number; maxOutputTokens: number }) {
   const body = {
@@ -67,7 +58,10 @@ async function callOpenRouter(apiKey: string, prompt: string, config: { temperat
 
   if (!res.ok) {
     const txt = await res.text().catch(() => "");
-    throw new Error(`OpenRouter error: ${res.status} ${res.statusText} ${txt}`);
+    const err: any = new Error(`OpenRouter error: ${res.status} ${res.statusText} ${txt}`);
+    err.status = res.status;
+    err.body = txt;
+    throw err;
   }
 
   const data = await res.json();
@@ -86,30 +80,61 @@ async function generateWithRotatingApiKey(
   const pool = parseProviderKeys();
 
   if (pool.length === 0) {
-    throw new Error("No API keys configured for any provider (GEMINI or OPENROUTER).");
+    throw new Error("No API keys configured for OpenRouter (OPENROUTER_API_KEYS).");
   }
 
   const start = getRandomIndex(pool.length);
   const tryOrder = [...pool.slice(start), ...pool.slice(0, start)];
 
   let lastError: unknown;
+  let rateLimitedCount = 0;
+
+  // For each key, allow a small number of transient retries (network/5xx). On 429, skip to next key.
+  // If only a single API key is configured, allow more retries because there is no alternate key to rotate to.
+  const maxAttemptsPerKey = pool.length === 1 ? 6 : 2;
+
+  if (pool.length === 1) {
+    console.info("Single OpenRouter key configured — using extended retries to handle transient errors or soft rate limits.");
+  }
+
   for (const entry of tryOrder) {
     const { provider, apiKey } = entry;
-    try {
-      if (provider === "gemini") {
-        console.info(`Trying Gemini key prefix ${apiKey.slice(0, 6)}`);
-        const ai = new GoogleGenAI({ apiKey });
-        return await ai.models.generateContent({ model: GEMINI_MODEL, contents: prompt, config });
-      }
+    const prefix = apiKey?.slice?.(0, 6) ?? "unknown";
 
-      if (provider === "openrouter") {
-        console.info(`Trying OpenRouter key prefix ${apiKey.slice(0, 6)}`);
-        return await callOpenRouter(apiKey, prompt, config);
+    for (let attempt = 1; attempt <= maxAttemptsPerKey; attempt++) {
+      try {
+        if (provider === "openrouter") {
+          console.info(`Trying OpenRouter key prefix ${prefix} (attempt ${attempt}/${maxAttemptsPerKey})`);
+          const resp = await callOpenRouter(apiKey, prompt, config);
+          return resp;
+        }
+      } catch (err: any) {
+        lastError = err;
+        const status = err?.status;
+
+        // If rate limited, move to next key immediately
+        if (status === 429 || (typeof err?.message === "string" && err.message.toLowerCase().includes("rate"))) {
+          rateLimitedCount++;
+          console.warn(`Key prefix ${prefix} returned rate limit (429). Skipping to next key.`);
+          break; // break attempts loop to move to next key
+        }
+
+        // For server errors or network failures, retry with exponential backoff
+        if (attempt < maxAttemptsPerKey) {
+          const backoffMs = 200 * Math.pow(2, attempt - 1);
+          console.warn(`Transient error with key ${prefix}, will retry after ${backoffMs}ms`, err?.message || err);
+          await new Promise((r) => setTimeout(r, backoffMs));
+          continue;
+        }
+
+        console.warn(`Key prefix ${prefix} failed after ${attempt} attempts.`, err?.message || err);
+        break;
       }
-    } catch (err) {
-      lastError = err;
-      console.warn(`Provider ${entry.provider} with prefix ${entry.apiKey.slice(0,6)} failed.`, err);
     }
+  }
+
+  if (rateLimitedCount === pool.length) {
+    throw new Error("All configured API keys are rate limited.");
   }
 
   throw lastError ?? new Error("Failed to generate using all configured provider keys.");
@@ -254,8 +279,16 @@ ${text.substring(0, 80000)}`;
 
     const errorMessage = error instanceof Error ? error.message : "Unknown error";
 
-    if (errorMessage.includes("API key")) {
-      return NextResponse.json({ success: false, error: "Invalid API key." }, { status: 401 });
+    const statusCode = (error as any)?.status;
+
+    // Detect invalid API key / unauthorized
+    if (
+      statusCode === 401 ||
+      statusCode === 403 ||
+      errorMessage.toLowerCase().includes("unauthor") ||
+      (errorMessage.toLowerCase().includes("invalid") && errorMessage.toLowerCase().includes("key"))
+    ) {
+      return NextResponse.json({ success: false, error: "Invalid API key. Check your OPENROUTER_API_KEYS in .env.local" }, { status: 401 });
     }
 
     if (errorMessage.includes("quota") || errorMessage.includes("rate")) {
