@@ -188,7 +188,7 @@ ${text.substring(0, 80000)}`;
 
     const rawResponse = await generateWithRotatingApiKey(prompt, {
       temperature: 0.7,
-      maxOutputTokens: 16384,
+      maxOutputTokens: 5000,
     });
 
     // Normalize response from different providers
