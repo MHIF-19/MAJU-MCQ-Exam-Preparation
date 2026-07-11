@@ -62,6 +62,14 @@ async function callOpenRouter(
     // schema, so the correct field is `max_tokens`, not `max_output_tokens`.
     // Using the wrong key meant this limit was silently ignored before.
     max_tokens: config.maxOutputTokens,
+    // Pin routing to Groq specifically. Without this, OpenRouter can route
+    // openai/gpt-oss-120b to whichever backing provider is available, which
+    // may be much slower than Groq's inference. Since this app is set up
+    // for a Groq BYOK key, we want to guarantee we're actually hitting Groq.
+    provider: {
+      order: ["Groq"],
+      allow_fallbacks: true,
+    },
   };
 
   try {
@@ -195,19 +203,18 @@ function computeMaxOutputTokens(numQuestions: number, difficulty: string) {
   return Math.min(Math.max(estimate, 4000), 16000);
 }
 
-export async function POST(request: NextRequest) {
-  try {
-    const body = await request.json();
-    const { text, numQuestions, difficulty } = body;
+// Large requests (e.g. 20 Hard questions) in a single call take long enough
+// for a reasoning model to regularly blow past the 50s per-attempt timeout.
+// Splitting into smaller batches that run IN PARALLEL keeps each individual
+// call fast, and the overall wall-clock time close to a single batch's time
+// instead of the sum of all of them.
+const MAX_QUESTIONS_PER_BATCH = 6;
+// Cap concurrency so a single BYOK key isn't hit with too many simultaneous
+// requests (soft rate limits on some providers).
+const MAX_CONCURRENT_BATCHES = 3;
 
-    if (!text || !numQuestions || !difficulty) {
-      return NextResponse.json(
-        { success: false, error: "Missing required fields." },
-        { status: 400 }
-      );
-    }
-
-    const prompt = `You are an expert university professor. Study all provided material carefully.
+function buildPrompt(text: string, numQuestions: number, difficulty: string) {
+  return `You are an expert university professor. Study all provided material carefully.
 Generate exactly ${numQuestions} multiple-choice questions with ${difficulty} difficulty.
 
 RULES:
@@ -240,92 +247,154 @@ Each element must follow this exact schema:
 
 STUDY MATERIAL:
 ${text.substring(0, 80000)}`;
+}
 
-    const rawResponse = await generateWithRotatingApiKey(prompt, {
-      temperature: 0.7,
-      maxOutputTokens: computeMaxOutputTokens(numQuestions, difficulty),
-    });
+// Parses a raw model response into validated QuizQuestion objects. Tolerates
+// truncated/partial JSON by salvaging whatever complete question objects it
+// can find, instead of failing the whole batch over one bad object.
+function parseQuestionsFromResponse(rawResponse: any): QuizQuestion[] {
+  let responseText = "";
+  try {
+    if (!rawResponse) responseText = "";
+    else if (typeof rawResponse === "string") responseText = rawResponse;
+    else if (typeof rawResponse.text === "string") responseText = rawResponse.text;
+    else if (typeof (rawResponse as any).result === "string") responseText = (rawResponse as any).result;
+    else if ((rawResponse as any).choices?.[0]?.message?.content)
+      responseText = (rawResponse as any).choices[0].message.content;
+    else if ((rawResponse as any).choices?.[0]?.text) responseText = (rawResponse as any).choices[0].text;
+    else if ((rawResponse as any).output?.[0]?.content) responseText = (rawResponse as any).output[0].content;
+    else responseText = JSON.stringify(rawResponse);
+  } catch {
+    responseText = String(rawResponse);
+  }
 
-    // Normalize response from different providers
-    let responseText = "";
-    try {
-      if (!rawResponse) responseText = "";
-      else if (typeof rawResponse === "string") responseText = rawResponse;
-      else if (typeof rawResponse.text === "string") responseText = rawResponse.text;
-      else if (typeof (rawResponse as any).result === "string") responseText = (rawResponse as any).result;
-      else if ((rawResponse as any).choices?.[0]?.message?.content)
-        responseText = (rawResponse as any).choices[0].message.content;
-      else if ((rawResponse as any).choices?.[0]?.text)
-        responseText = (rawResponse as any).choices[0].text;
-      else if ((rawResponse as any).output?.[0]?.content)
-        responseText = (rawResponse as any).output[0].content;
-      else responseText = JSON.stringify(rawResponse);
-    } catch (e) {
-      responseText = String(rawResponse);
+  responseText = (responseText || "").trim();
+
+  let jsonText = responseText;
+  if (jsonText.startsWith("```")) {
+    jsonText = jsonText.replace(/^```(?:json)?\s*\n?/, "").replace(/\n?```\s*$/, "");
+  }
+
+  let parsed: any = null;
+  try {
+    parsed = JSON.parse(jsonText);
+  } catch {
+    const arrayMatch = jsonText.match(/\[[\s\S]*\]/);
+    if (arrayMatch) {
+      try {
+        parsed = JSON.parse(arrayMatch[0]);
+      } catch {
+        parsed = null;
+      }
     }
 
-    responseText = (responseText || "").trim();
-
-    // Clean the response - remove markdown code blocks if present
-    let jsonText = responseText;
-    if (jsonText.startsWith("```")) {
-      jsonText = jsonText.replace(/^```(?:json)?\s*\n?/, "").replace(/\n?```\s*$/, "");
-    }
-
-    let questions: QuizQuestion[];
-    try {
-      questions = JSON.parse(jsonText);
-    } catch {
-      // Try to extract JSON array from the response
-      const arrayMatch = jsonText.match(/\[[\s\S]*\]/);
-      if (arrayMatch) {
-        try {
-          questions = JSON.parse(arrayMatch[0]);
-        } catch {
-          questions = null as any;
+    if (!parsed) {
+      // Salvage whatever complete {...} objects we can find from a
+      // truncated array (ran out of max_tokens mid-response).
+      const objectMatches = jsonText.match(/\{[^{}]*\}/g);
+      if (objectMatches && objectMatches.length > 0) {
+        const salvaged: any[] = [];
+        for (const objText of objectMatches) {
+          try {
+            salvaged.push(JSON.parse(objText));
+          } catch {
+            // skip incomplete/broken object
+          }
         }
+        if (salvaged.length > 0) {
+          parsed = salvaged;
+          console.warn(`Batch response appeared truncated; salvaged ${salvaged.length} question(s).`);
+        }
+      }
+    }
+  }
+
+  if (!parsed || !Array.isArray(parsed)) {
+    console.error("Raw AI response (unparseable):", responseText.slice(0, 2000));
+    return [];
+  }
+
+  return parsed.filter(
+    (q: any) =>
+      q &&
+      q.question &&
+      Array.isArray(q.options) &&
+      q.options.length === 4 &&
+      typeof q.correct === "number" &&
+      q.correct >= 0 &&
+      q.correct <= 3 &&
+      q.explanation &&
+      q.topic
+  );
+}
+
+// Splits the requested question count into batches and runs them in
+// parallel (bounded concurrency), merging the results. Keeps each
+// individual OpenRouter call small/fast so a reasoning model doesn't blow
+// past the per-request timeout on large requests.
+async function generateQuizInBatches(
+  text: string,
+  numQuestions: number,
+  difficulty: string
+): Promise<{ questions: QuizQuestion[]; batchErrors: unknown[] }> {
+  const batchSizes: number[] = [];
+  let remaining = numQuestions;
+  while (remaining > 0) {
+    const size = Math.min(MAX_QUESTIONS_PER_BATCH, remaining);
+    batchSizes.push(size);
+    remaining -= size;
+  }
+
+  const allQuestions: QuizQuestion[] = [];
+  const batchErrors: unknown[] = [];
+
+  for (let i = 0; i < batchSizes.length; i += MAX_CONCURRENT_BATCHES) {
+    const chunk = batchSizes.slice(i, i + MAX_CONCURRENT_BATCHES);
+
+    const results = await Promise.allSettled(
+      chunk.map((size) => {
+        const prompt = buildPrompt(text, size, difficulty);
+        return generateWithRotatingApiKey(prompt, {
+          temperature: 0.7,
+          maxOutputTokens: computeMaxOutputTokens(size, difficulty),
+        });
+      })
+    );
+
+    for (const result of results) {
+      if (result.status === "fulfilled") {
+        allQuestions.push(...parseQuestionsFromResponse(result.value));
       } else {
-        questions = null as any;
-      }
-
-      if (!questions) {
-        // Likely the response was cut off before valid JSON could close
-        // (ran out of max_tokens). Try to salvage complete question objects
-        // from a truncated array instead of failing the whole batch.
-        const objectMatches = jsonText.match(/\{[^{}]*\}/g);
-        if (objectMatches && objectMatches.length > 0) {
-          const salvaged: QuizQuestion[] = [];
-          for (const objText of objectMatches) {
-            try {
-              salvaged.push(JSON.parse(objText));
-            } catch {
-              // skip incomplete/broken object
-            }
-          }
-          if (salvaged.length > 0) {
-            questions = salvaged;
-            console.warn(
-              `Response appeared truncated; salvaged ${salvaged.length} of ${numQuestions} requested questions.`
-            );
-          }
-        }
-      }
-
-      if (!questions) {
-        console.error("Raw AI response (unparseable):", responseText.slice(0, 2000));
-        return NextResponse.json(
-          {
-            success: false,
-            error:
-              "AI response was cut off or malformed, likely due to a slow/overloaded model. Try again, or reduce the number of questions.",
-          },
-          { status: 500 }
-        );
+        console.warn("A quiz batch failed:", result.reason?.message || result.reason);
+        batchErrors.push(result.reason);
       }
     }
+  }
+
+  return { questions: allQuestions, batchErrors };
+}
+
+export async function POST(request: NextRequest) {
+  try {
+    const body = await request.json();
+    const { text, numQuestions, difficulty } = body;
+
+    if (!text || !numQuestions || !difficulty) {
+      return NextResponse.json(
+        { success: false, error: "Missing required fields." },
+        { status: 400 }
+      );
+    }
+
+    const { questions, batchErrors } = await generateQuizInBatches(text, numQuestions, difficulty);
 
     // Validate the questions
     if (!Array.isArray(questions) || questions.length === 0) {
+      // If every batch failed, surface the most useful underlying error
+      // (e.g. timeout, rate limit, invalid key) instead of a generic message.
+      if (batchErrors.length > 0) {
+        throw batchErrors[0];
+      }
       return NextResponse.json(
         {
           success: false,
@@ -335,32 +404,15 @@ ${text.substring(0, 80000)}`;
       );
     }
 
-    // Validate each question structure
-    const validQuestions = questions.filter(
-      (q) =>
-        q.question &&
-        Array.isArray(q.options) &&
-        q.options.length === 4 &&
-        typeof q.correct === "number" &&
-        q.correct >= 0 &&
-        q.correct <= 3 &&
-        q.explanation &&
-        q.topic
-    );
-
-    if (validQuestions.length === 0) {
-      return NextResponse.json(
-        {
-          success: false,
-          error: "AI generated questions with invalid structure. Please try again.",
-        },
-        { status: 500 }
-      );
-    }
-
     return NextResponse.json({
       success: true,
-      questions: validQuestions.slice(0, numQuestions),
+      questions: questions.slice(0, numQuestions),
+      // Let the client know if we got fewer than requested (some batches
+      // failed/timed out) so it can inform the user instead of silently
+      // showing a shorter quiz.
+      requested: numQuestions,
+      generated: Math.min(questions.length, numQuestions),
+      partial: questions.length < numQuestions,
     });
   } catch (error) {
     console.error("Generate error:", error);
