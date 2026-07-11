@@ -24,15 +24,19 @@ function parseKeysFromEnv(varNames: string[]): string[] {
   );
 }
 
-function getOpenRouterApiKey(): string {
-  const keys = parseKeysFromEnv(["OPENROUTER_API_KEYS", "OPENROUTER_API_KEY"]);
-  if (keys.length === 0) {
-    throw new Error("No API keys configured for OpenRouter (OPENROUTER_API_KEYS).");
-  }
-  return keys[0];
+function parseProviderKeys(): { provider: string; apiKey: string }[] {
+  // Only OpenRouter keys are accepted in this configuration
+  const providers: { provider: string; apiKey: string }[] = [];
+  const openrouter = parseKeysFromEnv(["OPENROUTER_API_KEYS", "OPENROUTER_API_KEY"]);
+  for (const k of openrouter) providers.push({ provider: "openrouter", apiKey: k });
+  return providers;
 }
 
-const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || "groq/llama-3.3-70b-versatile";
+function getRandomIndex(max: number) {
+  return Math.floor(Math.random() * max);
+}
+
+const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || "openai/gpt-oss-120b";
 const OPENROUTER_ENDPOINT = process.env.OPENROUTER_ENDPOINT || "https://openrouter.ai/api/v1/chat/completions";
 
 async function callOpenRouter(apiKey: string, prompt: string, config: { temperature: number; maxOutputTokens: number }) {
@@ -68,12 +72,72 @@ async function callOpenRouter(apiKey: string, prompt: string, config: { temperat
   return { text };
 }
 
-async function generateWithConfiguredApiKey(
+// Try each provider+key in a rotated order starting at a random index
+async function generateWithRotatingApiKey(
   prompt: string,
   config: { temperature: number; maxOutputTokens: number }
 ) {
-  const apiKey = getOpenRouterApiKey();
-  return callOpenRouter(apiKey, prompt, config);
+  const pool = parseProviderKeys();
+
+  if (pool.length === 0) {
+    throw new Error("No API keys configured for OpenRouter (OPENROUTER_API_KEYS).");
+  }
+
+  const start = getRandomIndex(pool.length);
+  const tryOrder = [...pool.slice(start), ...pool.slice(0, start)];
+
+  let lastError: unknown;
+  let rateLimitedCount = 0;
+
+  // For each key, allow a small number of transient retries (network/5xx). On 429, skip to next key.
+  // If only a single API key is configured, allow more retries because there is no alternate key to rotate to.
+  const maxAttemptsPerKey = pool.length === 1 ? 6 : 2;
+
+  if (pool.length === 1) {
+    console.info("Single OpenRouter key configured — using extended retries to handle transient errors or soft rate limits.");
+  }
+
+  for (const entry of tryOrder) {
+    const { provider, apiKey } = entry;
+    const prefix = apiKey?.slice?.(0, 6) ?? "unknown";
+
+    for (let attempt = 1; attempt <= maxAttemptsPerKey; attempt++) {
+      try {
+        if (provider === "openrouter") {
+          console.info(`Trying OpenRouter key prefix ${prefix} (attempt ${attempt}/${maxAttemptsPerKey})`);
+          const resp = await callOpenRouter(apiKey, prompt, config);
+          return resp;
+        }
+      } catch (err: any) {
+        lastError = err;
+        const status = err?.status;
+
+        // If rate limited, move to next key immediately
+        if (status === 429 || (typeof err?.message === "string" && err.message.toLowerCase().includes("rate"))) {
+          rateLimitedCount++;
+          console.warn(`Key prefix ${prefix} returned rate limit (429). Skipping to next key.`);
+          break; // break attempts loop to move to next key
+        }
+
+        // For server errors or network failures, retry with exponential backoff
+        if (attempt < maxAttemptsPerKey) {
+          const backoffMs = 200 * Math.pow(2, attempt - 1);
+          console.warn(`Transient error with key ${prefix}, will retry after ${backoffMs}ms`, err?.message || err);
+          await new Promise((r) => setTimeout(r, backoffMs));
+          continue;
+        }
+
+        console.warn(`Key prefix ${prefix} failed after ${attempt} attempts.`, err?.message || err);
+        break;
+      }
+    }
+  }
+
+  if (rateLimitedCount === pool.length) {
+    throw new Error("All configured API keys are rate limited.");
+  }
+
+  throw lastError ?? new Error("Failed to generate using all configured provider keys.");
 }
 
 export async function POST(request: NextRequest) {
@@ -119,12 +183,12 @@ Each element must follow this exact schema:
   "difficulty": "${difficulty}"
 }
 
-Study material:
-${text.substring(0, 60000)}`;
+STUDY MATERIAL:
+${text.substring(0, 80000)}`;
 
-    const rawResponse = await generateWithConfiguredApiKey(prompt, {
-      temperature: 0.5,
-      maxOutputTokens: 8072,
+    const rawResponse = await generateWithRotatingApiKey(prompt, {
+      temperature: 0.7,
+      maxOutputTokens: 8000,
     });
 
     // Normalize response from different providers
