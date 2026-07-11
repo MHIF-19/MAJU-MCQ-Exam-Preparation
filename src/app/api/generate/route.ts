@@ -39,37 +39,64 @@ function getRandomIndex(max: number) {
 const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || "openai/gpt-oss-120b";
 const OPENROUTER_ENDPOINT = process.env.OPENROUTER_ENDPOINT || "https://openrouter.ai/api/v1/chat/completions";
 
-async function callOpenRouter(apiKey: string, prompt: string, config: { temperature: number; maxOutputTokens: number }) {
+// Per-request timeout for a single attempt to OpenRouter. Kept comfortably
+// under Vercel's maxDuration (60s) so we can fail fast and retry/rotate
+// instead of hanging until the whole function is killed.
+const REQUEST_TIMEOUT_MS = Number(process.env.OPENROUTER_TIMEOUT_MS) || 25000;
+
+async function callOpenRouter(
+  apiKey: string,
+  prompt: string,
+  config: { temperature: number; maxOutputTokens: number }
+) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
   const body = {
     model: OPENROUTER_MODEL,
     messages: [{ role: "user", content: prompt }],
     temperature: config.temperature,
+    // NOTE: OpenRouter's chat completions endpoint follows the OpenAI-style
+    // schema, so the correct field is `max_tokens`, not `max_output_tokens`.
+    // Using the wrong key meant this limit was silently ignored before.
     max_tokens: config.maxOutputTokens,
-  } as any;
+  };
 
-  const res = await fetch(OPENROUTER_ENDPOINT, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify(body),
-  });
+  try {
+    const res = await fetch(OPENROUTER_ENDPOINT, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
 
-  if (!res.ok) {
-    const txt = await res.text().catch(() => "");
-    const err: any = new Error(`OpenRouter error: ${res.status} ${res.statusText} ${txt}`);
-    err.status = res.status;
-    err.body = txt;
+    if (!res.ok) {
+      const txt = await res.text().catch(() => "");
+      const err: any = new Error(`OpenRouter error: ${res.status} ${res.statusText} ${txt}`);
+      err.status = res.status;
+      err.body = txt;
+      throw err;
+    }
+
+    const data = await res.json();
+
+    const text =
+      data?.choices?.[0]?.message?.content || data?.choices?.[0]?.text || data?.output?.[0]?.content || "";
+
+    return { text };
+  } catch (err: any) {
+    if (err?.name === "AbortError") {
+      const timeoutErr: any = new Error(`OpenRouter request timed out after ${REQUEST_TIMEOUT_MS}ms`);
+      timeoutErr.status = 408;
+      throw timeoutErr;
+    }
     throw err;
+  } finally {
+    clearTimeout(timeoutId);
   }
-
-  const data = await res.json();
-
-  const text =
-    data?.choices?.[0]?.message?.content || data?.choices?.[0]?.text || data?.output?.[0]?.content || "";
-
-  return { text };
 }
 
 // Try each provider+key in a rotated order starting at a random index
@@ -89,9 +116,11 @@ async function generateWithRotatingApiKey(
   let lastError: unknown;
   let rateLimitedCount = 0;
 
-  // For each key, allow a small number of transient retries (network/5xx). On 429, skip to next key.
-  // If only a single API key is configured, allow more retries because there is no alternate key to rotate to.
-  const maxAttemptsPerKey = pool.length === 1 ? 6 : 2;
+  // For each key, allow a small number of transient retries (network/5xx/timeout).
+  // On 429, skip to next key. If only a single API key is configured, allow a
+  // couple of extra retries since there's no alternate key to rotate to — but
+  // keep this bounded so we don't eat the whole maxDuration budget.
+  const maxAttemptsPerKey = pool.length === 1 ? 3 : 2;
 
   if (pool.length === 1) {
     console.info("Single OpenRouter key configured — using extended retries to handle transient errors or soft rate limits.");
@@ -119,7 +148,7 @@ async function generateWithRotatingApiKey(
           break; // break attempts loop to move to next key
         }
 
-        // For server errors or network failures, retry with exponential backoff
+        // For server errors, timeouts, or network failures, retry with exponential backoff
         if (attempt < maxAttemptsPerKey) {
           const backoffMs = 200 * Math.pow(2, attempt - 1);
           console.warn(`Transient error with key ${prefix}, will retry after ${backoffMs}ms`, err?.message || err);
@@ -138,6 +167,17 @@ async function generateWithRotatingApiKey(
   }
 
   throw lastError ?? new Error("Failed to generate using all configured provider keys.");
+}
+
+// Rough token budget: ~150 tokens per MCQ (question + 4 options + explanation
+// + topic) is generous. We cap generously above that per requested question
+// count instead of a flat 16000, which was overkill and slowed generation
+// down (especially at "Hard" difficulty where reasoning is heavier).
+function computeMaxOutputTokens(numQuestions: number) {
+  const perQuestion = 220;
+  const overhead = 500; // JSON structure / formatting slack
+  const estimate = numQuestions * perQuestion + overhead;
+  return Math.min(Math.max(estimate, 1500), 8000);
 }
 
 export async function POST(request: NextRequest) {
@@ -188,7 +228,7 @@ ${text.substring(0, 80000)}`;
 
     const rawResponse = await generateWithRotatingApiKey(prompt, {
       temperature: 0.7,
-      maxOutputTokens: 16000,
+      maxOutputTokens: computeMaxOutputTokens(numQuestions),
     });
 
     // Normalize response from different providers
@@ -289,6 +329,13 @@ ${text.substring(0, 80000)}`;
       (errorMessage.toLowerCase().includes("invalid") && errorMessage.toLowerCase().includes("key"))
     ) {
       return NextResponse.json({ success: false, error: "Invalid API key. Check your OPENROUTER_API_KEYS in .env.local" }, { status: 401 });
+    }
+
+    if (statusCode === 408 || errorMessage.toLowerCase().includes("timed out")) {
+      return NextResponse.json(
+        { success: false, error: "The AI provider took too long to respond. Please try again, or try fewer questions." },
+        { status: 504 }
+      );
     }
 
     if (errorMessage.includes("quota") || errorMessage.includes("rate")) {
