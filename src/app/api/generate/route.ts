@@ -44,7 +44,7 @@ async function callOpenRouter(apiKey: string, prompt: string, config: { temperat
     model: OPENROUTER_MODEL,
     messages: [{ role: "user", content: prompt }],
     temperature: config.temperature,
-    max_output_tokens: config.maxOutputTokens,
+    max_tokens: config.maxOutputTokens,
   } as any;
 
   const res = await fetch(OPENROUTER_ENDPOINT, {
