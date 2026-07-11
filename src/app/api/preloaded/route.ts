@@ -6,6 +6,15 @@ import { parseDocumentBuffer } from "@/lib/parser";
 
 export const maxDuration = 60;
 
+const SUPPORTED_EXTENSIONS = new Set([
+  ".pdf",
+  ".doc",
+  ".docx",
+  ".ppt",
+  ".pptx",
+  ".txt",
+]);
+
 // Sample content generator to populate the folders if they are empty
 const SUBJECT_LECTURES: Record<string, Record<string, string>> = {
   cce: {
@@ -26,9 +35,19 @@ const SUBJECT_LECTURES: Record<string, Record<string, string>> = {
   },
 };
 
+function isSupportedFile(fileName: string) {
+  const extension = path.extname(fileName).toLowerCase();
+  return SUPPORTED_EXTENSIONS.has(extension);
+}
+
 function ensureDirectoryAndFiles(subjectId: string, dirPath: string) {
   if (!fs.existsSync(dirPath)) {
     fs.mkdirSync(dirPath, { recursive: true });
+  }
+
+  const existingFiles = fs.readdirSync(dirPath).filter((fileName) => isSupportedFile(fileName));
+  if (existingFiles.length > 0) {
+    return;
   }
 
   const lectures = SUBJECT_LECTURES[subjectId];
@@ -36,10 +55,16 @@ function ensureDirectoryAndFiles(subjectId: string, dirPath: string) {
 
   for (const [fileName, content] of Object.entries(lectures)) {
     const filePath = path.join(dirPath, fileName);
-    if (!fs.existsSync(filePath)) {
-      fs.writeFileSync(filePath, content, "utf-8");
-    }
+    fs.writeFileSync(filePath, content, "utf-8");
   }
+}
+
+function listLectureFiles(dirPath: string) {
+  return fs
+    .readdirSync(dirPath)
+    .filter((fileName) => isSupportedFile(fileName))
+    .sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }))
+    .map((fileName) => path.join(dirPath, fileName));
 }
 
 export async function POST(request: NextRequest) {
@@ -57,10 +82,7 @@ export async function POST(request: NextRequest) {
     const dirPath = path.join(process.cwd(), "public", "preloaded", subjectId);
     ensureDirectoryAndFiles(subjectId, dirPath);
 
-    const files = fs.readdirSync(dirPath).filter((f) => {
-      const ext = path.extname(f).toLowerCase();
-      return [".pdf", ".doc", ".docx", ".ppt", ".pptx", ".txt"].includes(ext);
-    });
+    const files = listLectureFiles(dirPath);
 
     if (files.length === 0) {
       return NextResponse.json(
@@ -73,14 +95,14 @@ export async function POST(request: NextRequest) {
     const parsedFilesInfo = [];
 
     // Parse files sequentially to preserve ordering and trace errors
-    for (const file of files) {
-      const filePath = path.join(dirPath, file);
+    for (const filePath of files) {
+      const fileName = path.basename(filePath);
       const buffer = fs.readFileSync(filePath);
-      const extractedText = await parseDocumentBuffer(buffer, file);
+      const extractedText = await parseDocumentBuffer(buffer, fileName);
 
       if (extractedText && extractedText.length >= 50) {
-        mergedText += `\n\n--- DOCUMENT: ${file} ---\n\n` + extractedText;
-        parsedFilesInfo.push({ name: file, length: extractedText.length });
+        mergedText += `\n\n--- DOCUMENT: ${fileName} ---\n\n` + extractedText;
+        parsedFilesInfo.push({ name: fileName, length: extractedText.length });
       }
     }
 
@@ -101,6 +123,7 @@ export async function POST(request: NextRequest) {
       text: mergedText,
       charCount: mergedText.length,
       filesParsed: parsedFilesInfo,
+      discoveredFiles: parsedFilesInfo.map((file) => file.name),
     });
   } catch (error) {
     console.error("Preloaded parse error:", error);
