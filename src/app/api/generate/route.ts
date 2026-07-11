@@ -124,7 +124,7 @@ ${text.substring(0, 60000)}`;
 
     const rawResponse = await generateWithConfiguredApiKey(prompt, {
       temperature: 0.5,
-      maxOutputTokens: 8072,
+      maxOutputTokens: 5072,
     });
 
     // Normalize response from different providers
