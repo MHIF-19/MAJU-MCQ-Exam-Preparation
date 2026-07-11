@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import type { QuizQuestion } from "@/types";
 
-export const maxDuration = 60;
+export const maxDuration = 120;
 
 // Helper to parse keys from env names (comma/newline/semicolon separated)
 function parseKeysFromEnv(varNames: string[]): string[] {
