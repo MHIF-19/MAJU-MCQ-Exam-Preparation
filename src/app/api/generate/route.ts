@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import type { QuizQuestion } from "@/types";
 
-export const maxDuration = 120;
+export const maxDuration = 60;
 
 // Helper to parse keys from env names (comma/newline/semicolon separated)
 function parseKeysFromEnv(varNames: string[]): string[] {
@@ -188,7 +188,7 @@ ${text.substring(0, 80000)}`;
 
     const rawResponse = await generateWithRotatingApiKey(prompt, {
       temperature: 0.7,
-      maxOutputTokens: 8000,
+      maxOutputTokens: 16000,
     });
 
     // Normalize response from different providers
