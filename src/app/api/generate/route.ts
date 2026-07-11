@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import type { QuizQuestion } from "@/types";
 
-export const maxDuration = 120;
+export const maxDuration = 60;
 
 // Helper to parse keys from env names (comma/newline/semicolon separated)
 function parseKeysFromEnv(varNames: string[]): string[] {
@@ -39,10 +39,12 @@ function getRandomIndex(max: number) {
 const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || "openai/gpt-oss-120b";
 const OPENROUTER_ENDPOINT = process.env.OPENROUTER_ENDPOINT || "https://openrouter.ai/api/v1/chat/completions";
 
-// Per-request timeout for a single attempt to OpenRouter. Kept comfortably
-// under Vercel's maxDuration (60s) so we can fail fast and retry/rotate
-// instead of hanging until the whole function is killed.
-const REQUEST_TIMEOUT_MS = Number(process.env.OPENROUTER_TIMEOUT_MS) || 25000;
+// Per-request timeout for a single attempt to OpenRouter. Reasoning models
+// (like gpt-oss-120b) can genuinely take 30-50s to finish thinking + answer,
+// so this needs real headroom. Kept just under Vercel's maxDuration (60s)
+// for a single try; with a single API key we only get one full-length
+// attempt anyway (see maxAttemptsPerKey below).
+const REQUEST_TIMEOUT_MS = Number(process.env.OPENROUTER_TIMEOUT_MS) || 50000;
 
 async function callOpenRouter(
   apiKey: string,
@@ -120,7 +122,11 @@ async function generateWithRotatingApiKey(
   // On 429, skip to next key. If only a single API key is configured, allow a
   // couple of extra retries since there's no alternate key to rotate to — but
   // keep this bounded so we don't eat the whole maxDuration budget.
-  const maxAttemptsPerKey = pool.length === 1 ? 3 : 2;
+  // Single key + a 50s per-attempt timeout means we can't afford more than
+  // one real attempt without risking the 60s function limit — extra
+  // "retries" here would just be near-instant failures anyway if the first
+  // one times out. Keep it at 1 for a single key, 2 when we can rotate.
+  const maxAttemptsPerKey = pool.length === 1 ? 1 : 2;
 
   if (pool.length === 1) {
     console.info("Single OpenRouter key configured — using extended retries to handle transient errors or soft rate limits.");
@@ -169,15 +175,24 @@ async function generateWithRotatingApiKey(
   throw lastError ?? new Error("Failed to generate using all configured provider keys.");
 }
 
-// Rough token budget: ~150 tokens per MCQ (question + 4 options + explanation
-// + topic) is generous. We cap generously above that per requested question
-// count instead of a flat 16000, which was overkill and slowed generation
-// down (especially at "Hard" difficulty where reasoning is heavier).
-function computeMaxOutputTokens(numQuestions: number) {
-  const perQuestion = 220;
-  const overhead = 500; // JSON structure / formatting slack
-  const estimate = numQuestions * perQuestion + overhead;
-  return Math.min(Math.max(estimate, 1500), 8000);
+// IMPORTANT: gpt-oss-120b is a reasoning model — its internal "thinking"
+// tokens are counted against the SAME max_tokens budget as the final answer.
+// Setting this too low (as a naive "~200 tokens per question" estimate would)
+// causes the model to get cut off mid-JSON before it even finishes reasoning,
+// which is what was producing "syntax error" / invalid JSON responses.
+// So we budget generously: a healthy reasoning allowance PLUS the actual
+// answer tokens, scaled a bit by difficulty since Hard prompts reason more.
+function computeMaxOutputTokens(numQuestions: number, difficulty: string) {
+  const perQuestionAnswer = 180; // actual JSON answer tokens per MCQ
+  const answerOverhead = 400; // JSON brackets/formatting slack
+  const reasoningBudget =
+    difficulty === "Hard" ? 6000 : difficulty === "Medium" ? 4000 : 2500;
+
+  const estimate = numQuestions * perQuestionAnswer + answerOverhead + reasoningBudget;
+
+  // Cap well under typical provider context limits, floor high enough that
+  // even a single question always has room to reason and answer.
+  return Math.min(Math.max(estimate, 4000), 16000);
 }
 
 export async function POST(request: NextRequest) {
@@ -228,7 +243,7 @@ ${text.substring(0, 80000)}`;
 
     const rawResponse = await generateWithRotatingApiKey(prompt, {
       temperature: 0.7,
-      maxOutputTokens: computeMaxOutputTokens(numQuestions),
+      maxOutputTokens: computeMaxOutputTokens(numQuestions, difficulty),
     });
 
     // Normalize response from different providers
@@ -264,12 +279,45 @@ ${text.substring(0, 80000)}`;
       // Try to extract JSON array from the response
       const arrayMatch = jsonText.match(/\[[\s\S]*\]/);
       if (arrayMatch) {
-        questions = JSON.parse(arrayMatch[0]);
+        try {
+          questions = JSON.parse(arrayMatch[0]);
+        } catch {
+          questions = null as any;
+        }
       } else {
+        questions = null as any;
+      }
+
+      if (!questions) {
+        // Likely the response was cut off before valid JSON could close
+        // (ran out of max_tokens). Try to salvage complete question objects
+        // from a truncated array instead of failing the whole batch.
+        const objectMatches = jsonText.match(/\{[^{}]*\}/g);
+        if (objectMatches && objectMatches.length > 0) {
+          const salvaged: QuizQuestion[] = [];
+          for (const objText of objectMatches) {
+            try {
+              salvaged.push(JSON.parse(objText));
+            } catch {
+              // skip incomplete/broken object
+            }
+          }
+          if (salvaged.length > 0) {
+            questions = salvaged;
+            console.warn(
+              `Response appeared truncated; salvaged ${salvaged.length} of ${numQuestions} requested questions.`
+            );
+          }
+        }
+      }
+
+      if (!questions) {
+        console.error("Raw AI response (unparseable):", responseText.slice(0, 2000));
         return NextResponse.json(
           {
             success: false,
-            error: "AI generated an invalid response. Please try again.",
+            error:
+              "AI response was cut off or malformed, likely due to a slow/overloaded model. Try again, or reduce the number of questions.",
           },
           { status: 500 }
         );
